@@ -1,5 +1,5 @@
 /*
-  Meteomini - Senzorická stanice pro ESP32 s čidly SGP41, SCD41 a SHT41
+  Meteomini - Senzorická stanice pro ESP32 s čidly SGP41, SCD41 a SHT40
   ---------------------------------------------------------
   Autor: kabelkao
 
@@ -22,7 +22,7 @@
 
   HARDWARE:
     - ESP32
-    - SHT41 (teplota, vlhkost)
+    - SHT40 (teplota, vlhkost)
     - SGP41 (VOC)
     - SCD41 (CO2, teplota, vlhkost)
     - Napájení z baterie (měření přes dělič napětí)
