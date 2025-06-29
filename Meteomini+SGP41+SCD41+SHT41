@@ -1,37 +1,75 @@
-#include <Wire.h>
-#include <Adafruit_SHT4x.h>
-#include "SparkFun_SCD4x_Arduino_Library.h"
-#include "SensirionI2CSgp41.h"
-#include "VOCGasIndexAlgorithm.h"
-#include <WiFiManager.h>
-#include <HTTPClient.h>
-#include <esp_wifi.h>
-#include <esp_sleep.h>
-#include <Preferences.h>
+/*
+  Meteomini - Senzorická stanice pro ESP32 s čidly SGP41, SCD41 a SHT41
+  ---------------------------------------------------------
+  Autor: kabelkao
 
-#define POWER_ENABLE_PIN 3
-#define SDA_PIN 19
-#define SCL_PIN 18
+  LOGIKA PROGRAMU:
+  ----------------
+  1. Při startu ESP32 povolí napájení senzorů.
+  2. Inicializuje I2C sběrnici a připojená čidla (SHT40 - teplota/vlhkost, SCD41 - CO2, SGP41 - VOC).
+  3. Provede test funkčnosti všech čidel (v případě chyby se vypne napájení a ESP32 se uspí).
+  4. Načte uložený stav VOC algoritmu z NVS paměti.
+  5. Změří teplotu a vlhkost přes SHT40.
+  6. Provede 60 měření VOC pomocí SGP41 s kompenzací prostředí (dle SHT40), VOC index počítá algoritmus.
+  7. Po ukončení měření uloží stav VOC algoritmu zpět do NVS paměti.
+  8. Získá platné měření CO2, teploty a vlhkosti ze SCD41 (max. 30s čekání).
+  9. Vypne napájení senzorů.
+  10. Změří napětí baterie přes dělič a ADC.
+  11. Vše vypíše na sériovou linku.
+  12. Pokud je WiFi připojení aktivní, odešle data na server pomocí HTTP GET dotazu.
+  13. Nakonec ESP32 uspí na 10 minut (deep sleep).
+  14. Po probuzení se celý cyklus opakuje od začátku.
 
-// --- Napájení baterie ---
-#define ADCBpin 0
-#define bDeviderRatio 1.82274
+  HARDWARE:
+    - ESP32
+    - SHT41 (teplota, vlhkost)
+    - SGP41 (VOC)
+    - SCD41 (CO2, teplota, vlhkost)
+    - Napájení z baterie (měření přes dělič napětí)
+    - Vývod pro povolení napájení (POWER_ENABLE_PIN)
+    - I2C sběrnice na pinech 18 (SCL) a 19 (SDA)
+    - Analogový vstup pro měření baterie na pinu 0
 
-Adafruit_SHT4x sht40;
-SCD4x scd41;
-SensirionI2CSgp41 sgp41;
-VOCGasIndexAlgorithm voc_algorithm;
-Preferences preferences;
+  SOFTWARE:
+    - Používá knihovny: Adafruit_SHT4x, SparkFun_SCD4x_Arduino_Library, SensirionI2CSgp41, VOCGasIndexAlgorithm, WiFiManager, HTTPClient, esp_wifi, esp_sleep, Preferences
+    - Vše probíhá v setup(), loop() je prázdný (běh jednou a pak uspání)
+*/
 
-String serverName = "http://xxxxx.tmep.cz/?";
+#include <Wire.h>                       // I2C komunikace
+#include <Adafruit_SHT4x.h>             // SHT40/SHT41 knihovna
+#include "SparkFun_SCD4x_Arduino_Library.h" // SCD41 knihovna
+#include "SensirionI2CSgp41.h"          // SGP41 knihovna
+#include "VOCGasIndexAlgorithm.h"       // Algoritmus pro VOC index
+#include <WiFiManager.h>                // Snadná konfigurace WiFi přes AP
+#include <HTTPClient.h>                 // HTTP klient pro odesílání dat
+#include <esp_wifi.h>                   // Ovládání WiFi (uspání)
+#include <esp_sleep.h>                  // Uspání čipu
+#include <Preferences.h>                // NVS paměť pro uložení stavu algoritmu
 
-// --- Funkce pro bezpečné načtení/uložení stavu VOC algoritmu ---
+// --- Definice pinů a konstant ---
+#define POWER_ENABLE_PIN 3              // Výstup pro povolení napájení čidel
+#define SDA_PIN 19                      // I2C SDA pin
+#define SCL_PIN 18                      // I2C SCL pin
+
+#define ADCBpin 0                       // Analogový vstup pro měření baterie
+#define bDeviderRatio 1.82274           // Poměr děliče napětí pro měření baterie
+
+// --- Globální objekty ---
+Adafruit_SHT4x sht40;                   // SHT40 (teplota, vlhkost)
+SCD4x scd41;                            // SCD41 (CO2, teplota, vlhkost)
+SensirionI2CSgp41 sgp41;                // SGP41 (VOC)
+VOCGasIndexAlgorithm voc_algorithm;     // Algoritmus pro VOC index
+Preferences preferences;                // Objekt pro práci s NVS pamětí
+
+String serverName = "http://xxxxx.tmep.cz/?"; // URL serveru pro odesílání dat
+
+// --- Funkce pro bezpečné načtení/uložení stavu VOC algoritmu do NVS paměti ESP32 ---
 void save_voc_state(VOCGasIndexAlgorithm &voc) {
   preferences.begin("sgp41voc", false);
   float voc0, voc1;
   voc.get_states(voc0, voc1);
-  preferences.putFloat("voc0", voc0);
-  preferences.putFloat("voc1", voc1);
+  preferences.putFloat("voc0", voc0);   // Uložení stavu 0
+  preferences.putFloat("voc1", voc1);   // Uložení stavu 1
   preferences.end();
   Serial.print("Uložený stav VOC: voc0="); Serial.print(voc0);
   Serial.print(" voc1="); Serial.println(voc1);
@@ -43,49 +81,52 @@ void load_voc_state(VOCGasIndexAlgorithm &voc) {
   float voc1 = preferences.getFloat("voc1", NAN);
   preferences.end();
   if (!isnan(voc0) && !isnan(voc1) && (voc0 != 0.0f || voc1 != 0.0f)) {
-    voc.set_states(voc0, voc1);
+    voc.set_states(voc0, voc1);         // Obnovení stavu algoritmu
     Serial.println("Stav VOC algoritmu obnoven z paměti.");
   } else {
     Serial.println("VOC algoritmus začíná s výchozím stavem.");
   }
 }
 
-// Funkce pro uspání
+// --- Funkce pro uspání čipu do deep sleep na 10 minut ---
 void go_to_sleep() {
   Serial.println("Jdu spát na 10 minut...");
-  esp_wifi_stop();
+  esp_wifi_stop();                      // Vypnutí WiFi pro úsporu
   esp_deep_sleep(10 * 60 * 1000000ULL); // 10 minut v mikrosekundách
 }
 
+// --- Hlavní program ---
 void setup() {
-  pinMode(POWER_ENABLE_PIN, OUTPUT);
-  digitalWrite(POWER_ENABLE_PIN, HIGH);
+  pinMode(POWER_ENABLE_PIN, OUTPUT);    // Nastavení výstupního pinu pro napájení čidel
+  digitalWrite(POWER_ENABLE_PIN, HIGH); // Zapnutí napájení čidel
 
   Serial.begin(115200);
   delay(300);
 
+  // --- Připojení k WiFi přes WiFiManager (případně vytvoří AP pro konfiguraci) ---
   WiFiManager wifiManager;
   wifiManager.autoConnect("ESP32-Config");
 
+  // --- Inicializace I2C sběrnice ---
   Wire.begin(SDA_PIN, SCL_PIN);
 
-  // --- SHT40 ---
+  // --- Inicializace SHT40 (teplota, vlhkost) ---
   if (!sht40.begin()) {
     Serial.println("SHT40 nenalezen!");
     digitalWrite(POWER_ENABLE_PIN, LOW);
     go_to_sleep();
   }
 
-  // --- SCD41 ---
+  // --- Inicializace SCD41 (CO2, teplota, vlhkost) ---
   if (!scd41.begin(false, true)) {
     Serial.println("SCD41 nenalezen!");
     digitalWrite(POWER_ENABLE_PIN, LOW);
     go_to_sleep();
   }
-  scd41.startLowPowerPeriodicMeasurement();
-  delay(5000);
+  scd41.startLowPowerPeriodicMeasurement(); // Spuštění měření v SCD41
+  delay(5000); // Požadováno pro první validní měření
 
-  // --- SGP41 ---
+  // --- Inicializace SGP41 (VOC) a self-test ---
   sgp41.begin(Wire);
   uint16_t testResult;
   uint16_t error = sgp41.executeSelfTest(testResult);
@@ -96,25 +137,25 @@ void setup() {
     go_to_sleep();
   }
 
-  // --- Bezpečné načtení stavu VOC algoritmu ---
+  // --- Načtení stavu VOC algoritmu z NVS paměti ---
   load_voc_state(voc_algorithm);
 
-  // --- SHT40 měření ---
+  // --- Měření teploty a vlhkosti SHT40 ---
   sensors_event_t humidity, temp;
   float sht_temp = NAN, sht_rh = NAN;
   if (sht40.getEvent(&humidity, &temp)) {
     sht_temp = temp.temperature;
     sht_rh = humidity.relative_humidity;
   } else {
-    // Pokud čtení selže, použij default hodnoty
     sht_temp = 25.0;
     sht_rh = 50.0;
     Serial.println("SHT40 chyba čtení! Používám default hodnoty.");
   }
 
-  // --- SGP41 60× měření s kompenzací dle SHT40 ---
+  // --- SGP41: 60× měření (1 min, 1 Hz) s kompenzací SHT40 ---
   float voc_index = 0;
-  for (int i = 0; i < 60; i++) { // 60 měření = 1 minuta po 1 Hz (doporučeno výrobcem)
+  for (int i = 0; i < 60; i++) {
+    // Přepočet hodnot pro kompenzaci (viz datasheet SGP41)
     uint16_t compRH = (uint16_t)((sht_rh * 65535.0f) / 100.0f);
     uint16_t compT = (uint16_t)(((sht_temp + 45.0f) * 65535.0f) / 175.0f);
 
@@ -122,20 +163,20 @@ void setup() {
     uint16_t sgp41_error = sgp41.measureRawSignals(compRH, compT, srawVoc, srawNox);
 
     if (!sgp41_error) {
-      voc_index = voc_algorithm.process(srawVoc);
+      voc_index = voc_algorithm.process(srawVoc); // Výpočet VOC indexu
     } else {
       Serial.print("SGP41 error: ");
       Serial.println(sgp41_error);
     }
     Serial.print("SGP41 ["); Serial.print(i+1); Serial.print("/60]: VOC="); Serial.println(voc_index, 1);
 
-    delay(1000);
+    delay(1000); // 1 Hz měření
   }
 
-  // --- Ulož stav VOC algoritmu do NVS až po měření ---
+  // --- Uložení stavu VOC algoritmu po měření ---
   save_voc_state(voc_algorithm);
 
-  // --- SCD41 validní měření ---
+  // --- SCD41: Čekání na validní měření (max 30s) ---
   float scd_co2 = NAN, scd_temp = NAN, scd_rh = NAN;
   bool scd_ok = false;
   unsigned long start = millis();
@@ -153,19 +194,22 @@ void setup() {
     Serial.println("SCD41: Validní měření se nepodařilo získat v časovém limitu.");
   }
 
+  // --- Vypnutí napájení čidel (POWER_ENABLE_PIN) ---
   digitalWrite(POWER_ENABLE_PIN, LOW);
 
-  // --- Napětí baterie ---
+  // --- Měření napětí baterie přes ADC ---
   float bat_voltage = analogReadMilliVolts(ADCBpin) * bDeviderRatio / 1000.0;
   Serial.print("Napeti akumulatoru = ");
   Serial.print(bat_voltage, 2);
   Serial.println(" V");
 
+  // --- Výpis naměřených hodnot na sériovou linku ---
   Serial.println("Naměřené hodnoty:");
   Serial.print("SHT40: T="); Serial.print(sht_temp, 2); Serial.print("°C, RH="); Serial.print(sht_rh, 2); Serial.println("%");
   Serial.print("SGP41: VOC="); Serial.println(voc_index, 1);
   Serial.print("SCD41: CO2="); Serial.print(scd_co2, 1); Serial.print("ppm, T="); Serial.print(scd_temp, 2); Serial.print("°C, RH="); Serial.print(scd_rh, 2); Serial.println("%");
 
+  // --- Odeslání dat na server přes HTTP GET ---
   if (WiFi.status() == WL_CONNECTED) {
     HTTPClient http;
     String serverPath = serverName +
@@ -195,6 +239,7 @@ void setup() {
     Serial.println("WiFi not connected, data not sent.");
   }
 
+  // --- Uspání čipu (deep sleep na 10 minut) ---
   go_to_sleep();
 }
 
