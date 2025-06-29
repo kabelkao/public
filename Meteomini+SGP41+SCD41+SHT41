@@ -1,0 +1,203 @@
+#include <Wire.h>
+#include <Adafruit_SHT4x.h>
+#include "SparkFun_SCD4x_Arduino_Library.h"
+#include "SensirionI2CSgp41.h"
+#include "VOCGasIndexAlgorithm.h"
+#include <WiFiManager.h>
+#include <HTTPClient.h>
+#include <esp_wifi.h>
+#include <esp_sleep.h>
+#include <Preferences.h>
+
+#define POWER_ENABLE_PIN 3
+#define SDA_PIN 19
+#define SCL_PIN 18
+
+// --- Napájení baterie ---
+#define ADCBpin 0
+#define bDeviderRatio 1.82274
+
+Adafruit_SHT4x sht40;
+SCD4x scd41;
+SensirionI2CSgp41 sgp41;
+VOCGasIndexAlgorithm voc_algorithm;
+Preferences preferences;
+
+String serverName = "http://xxxxx.tmep.cz/?";
+
+// --- Funkce pro bezpečné načtení/uložení stavu VOC algoritmu ---
+void save_voc_state(VOCGasIndexAlgorithm &voc) {
+  preferences.begin("sgp41voc", false);
+  float voc0, voc1;
+  voc.get_states(voc0, voc1);
+  preferences.putFloat("voc0", voc0);
+  preferences.putFloat("voc1", voc1);
+  preferences.end();
+  Serial.print("Uložený stav VOC: voc0="); Serial.print(voc0);
+  Serial.print(" voc1="); Serial.println(voc1);
+}
+
+void load_voc_state(VOCGasIndexAlgorithm &voc) {
+  preferences.begin("sgp41voc", true);
+  float voc0 = preferences.getFloat("voc0", NAN);
+  float voc1 = preferences.getFloat("voc1", NAN);
+  preferences.end();
+  if (!isnan(voc0) && !isnan(voc1) && (voc0 != 0.0f || voc1 != 0.0f)) {
+    voc.set_states(voc0, voc1);
+    Serial.println("Stav VOC algoritmu obnoven z paměti.");
+  } else {
+    Serial.println("VOC algoritmus začíná s výchozím stavem.");
+  }
+}
+
+// Funkce pro uspání
+void go_to_sleep() {
+  Serial.println("Jdu spát na 10 minut...");
+  esp_wifi_stop();
+  esp_deep_sleep(10 * 60 * 1000000ULL); // 10 minut v mikrosekundách
+}
+
+void setup() {
+  pinMode(POWER_ENABLE_PIN, OUTPUT);
+  digitalWrite(POWER_ENABLE_PIN, HIGH);
+
+  Serial.begin(115200);
+  delay(300);
+
+  WiFiManager wifiManager;
+  wifiManager.autoConnect("ESP32-Config");
+
+  Wire.begin(SDA_PIN, SCL_PIN);
+
+  // --- SHT40 ---
+  if (!sht40.begin()) {
+    Serial.println("SHT40 nenalezen!");
+    digitalWrite(POWER_ENABLE_PIN, LOW);
+    go_to_sleep();
+  }
+
+  // --- SCD41 ---
+  if (!scd41.begin(false, true)) {
+    Serial.println("SCD41 nenalezen!");
+    digitalWrite(POWER_ENABLE_PIN, LOW);
+    go_to_sleep();
+  }
+  scd41.startLowPowerPeriodicMeasurement();
+  delay(5000);
+
+  // --- SGP41 ---
+  sgp41.begin(Wire);
+  uint16_t testResult;
+  uint16_t error = sgp41.executeSelfTest(testResult);
+  if (error || testResult != 0xD400) {
+    Serial.print("SGP41 self-test failed! Error: ");
+    Serial.println(error);
+    digitalWrite(POWER_ENABLE_PIN, LOW);
+    go_to_sleep();
+  }
+
+  // --- Bezpečné načtení stavu VOC algoritmu ---
+  load_voc_state(voc_algorithm);
+
+  // --- SHT40 měření ---
+  sensors_event_t humidity, temp;
+  float sht_temp = NAN, sht_rh = NAN;
+  if (sht40.getEvent(&humidity, &temp)) {
+    sht_temp = temp.temperature;
+    sht_rh = humidity.relative_humidity;
+  } else {
+    // Pokud čtení selže, použij default hodnoty
+    sht_temp = 25.0;
+    sht_rh = 50.0;
+    Serial.println("SHT40 chyba čtení! Používám default hodnoty.");
+  }
+
+  // --- SGP41 60× měření s kompenzací dle SHT40 ---
+  float voc_index = 0;
+  for (int i = 0; i < 60; i++) { // 60 měření = 1 minuta po 1 Hz (doporučeno výrobcem)
+    uint16_t compRH = (uint16_t)((sht_rh * 65535.0f) / 100.0f);
+    uint16_t compT = (uint16_t)(((sht_temp + 45.0f) * 65535.0f) / 175.0f);
+
+    uint16_t srawVoc = 0, srawNox = 0;
+    uint16_t sgp41_error = sgp41.measureRawSignals(compRH, compT, srawVoc, srawNox);
+
+    if (!sgp41_error) {
+      voc_index = voc_algorithm.process(srawVoc);
+    } else {
+      Serial.print("SGP41 error: ");
+      Serial.println(sgp41_error);
+    }
+    Serial.print("SGP41 ["); Serial.print(i+1); Serial.print("/60]: VOC="); Serial.println(voc_index, 1);
+
+    delay(1000);
+  }
+
+  // --- Ulož stav VOC algoritmu do NVS až po měření ---
+  save_voc_state(voc_algorithm);
+
+  // --- SCD41 validní měření ---
+  float scd_co2 = NAN, scd_temp = NAN, scd_rh = NAN;
+  bool scd_ok = false;
+  unsigned long start = millis();
+  while (millis() - start < 30000) {
+    if (scd41.readMeasurement()) {
+      scd_co2 = scd41.getCO2();
+      scd_temp = scd41.getTemperature();
+      scd_rh = scd41.getHumidity();
+      scd_ok = true;
+      break;
+    }
+    delay(500);
+  }
+  if (!scd_ok) {
+    Serial.println("SCD41: Validní měření se nepodařilo získat v časovém limitu.");
+  }
+
+  digitalWrite(POWER_ENABLE_PIN, LOW);
+
+  // --- Napětí baterie ---
+  float bat_voltage = analogReadMilliVolts(ADCBpin) * bDeviderRatio / 1000.0;
+  Serial.print("Napeti akumulatoru = ");
+  Serial.print(bat_voltage, 2);
+  Serial.println(" V");
+
+  Serial.println("Naměřené hodnoty:");
+  Serial.print("SHT40: T="); Serial.print(sht_temp, 2); Serial.print("°C, RH="); Serial.print(sht_rh, 2); Serial.println("%");
+  Serial.print("SGP41: VOC="); Serial.println(voc_index, 1);
+  Serial.print("SCD41: CO2="); Serial.print(scd_co2, 1); Serial.print("ppm, T="); Serial.print(scd_temp, 2); Serial.print("°C, RH="); Serial.print(scd_rh, 2); Serial.println("%");
+
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+    String serverPath = serverName +
+      "temp=" + String(sht_temp, 2) +
+      "&hum=" + String(sht_rh, 2) +
+      "&co2=" + String(scd_co2, 1) +
+      "&voc=" + String(voc_index, 1) +
+      "&scdtemp=" + String(scd_temp, 2) +
+      "&scdrh=" + String(scd_rh, 2) +
+      "&v=" + String(bat_voltage, 2) +
+      "&rssi=" + String(WiFi.RSSI());
+    Serial.println("Odesílám: " + serverPath);
+
+    http.begin(serverPath.c_str());
+    int httpResponseCode = http.GET();
+    if (httpResponseCode > 0) {
+      Serial.print("HTTP Response code: ");
+      Serial.println(httpResponseCode);
+      String payload = http.getString();
+      Serial.println(payload);
+    } else {
+      Serial.print("HTTP error: ");
+      Serial.println(httpResponseCode);
+    }
+    http.end();
+  } else {
+    Serial.println("WiFi not connected, data not sent.");
+  }
+
+  go_to_sleep();
+}
+
+void loop() {
+  // Nepoužito, vše je v setup()
+}
