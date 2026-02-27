@@ -1,0 +1,233 @@
+# TMEP.cz - Čtení dat přes JSON
+
+## Základní informace
+
+TMEP.cz umožňuje exportovat naměřená data ve formátu JSON. Můžete číst data z jednoho čidla nebo všech čidel najednou.
+
+## Konfigurace
+
+```cpp
+// ID čidla nebo uživatele
+const char* TMEP_ID = "123456";
+
+// Export key (získáte v administraci TMEP.cz)
+const char* TMEP_EXPORT_KEY = "vas-export-klic";
+
+// Definice čísel čidel pro snadnou identifikaci
+const int CIDLO_OBYVAK = 111111;
+const int CIDLO_LOZNICE = 222222;
+const int CIDLO_VENKU = 333333;
+```
+
+## Jak číst data
+
+### 1. Čtení jednoho čidla
+
+**URL formát:**
+```
+http://tmep.cz/vystup-json.php?id=ID_CIDLA&export_key=EXPORT_KEY
+```
+
+**Příklad použití:**
+```cpp
+String url = "http://tmep.cz/vystup-json.php?";
+url += "id=" + String(CIDLO_OBYVAK);
+url += "&export_key=" + String(TMEP_EXPORT_KEY);
+
+HTTPClient http;
+http.begin(url);
+int httpCode = http.GET();
+if (httpCode == 200) {
+  String json = http.getString();
+  // Parsovat JSON...
+}
+http.end();
+```
+
+**Vrácený JSON:**
+```json
+{
+  "teplota": 21.6,
+  "vlhkost": 42.7,
+  "cas": "2026-02-27 14:30:15",
+  "nadpis": "Teploměr obývák",
+  "domena": "moje-domena.tmep.cz"
+}
+```
+
+---
+
+### 2. Čtení všech čidel najednou
+
+**URL formát:**
+```
+http://tmep.cz/vystup-json.php?id=ID_UZIVATELE&export_key=EXPORT_KEY&all=1
+```
+
+**Příklad použití:**
+```cpp
+String url = "http://tmep.cz/vystup-json.php?";
+url += "id=" + String(TMEP_ID);              // ID uživatele, ne čidla!
+url += "&export_key=" + String(TMEP_EXPORT_KEY);
+url += "&all=1";                             // Všechna čidla
+
+HTTPClient http;
+http.begin(url);
+int httpCode = http.GET();
+if (httpCode == 200) {
+  String json = http.getString();
+  // Parsovat JSON...
+}
+http.end();
+```
+
+**Vrácený JSON:**
+```json
+{
+  "111111": {
+    "teplota": 22.5,
+    "vlhkost": 45.0,
+    "cas": "2026-02-27 14:30:15",
+    "nadpis": "Obývák"
+  },
+  "222222": {
+    "teplota": 20.1,
+    "vlhkost": 50.2,
+    "cas": "2026-02-27 14:28:10",
+    "nadpis": "Ložnice"
+  },
+  "333333": {
+    "teplota": 5.3,
+    "vlhkost": 78.5,
+    "cas": "2026-02-27 14:29:45",
+    "nadpis": "Venku"
+  }
+}
+```
+
+---
+
+### 3. Rozšířený export (minima, maxima)
+
+Přidejte parametr `&extended=1` pro denní statistiky:
+
+```cpp
+url += "&extended=1";
+```
+
+**Vrácený JSON:**
+```json
+{
+  "teplota": 22.1,
+  "vlhkost": 40.8,
+  "tlak": 1013.2,
+  "nejnizsiTeplota": 18.4,
+  "nejvyssiTeplota": 22.2,
+  "nejnizsiVlhkost": 38.0,
+  "nejvyssiVlhkost": 45.3,
+  "cas": "2026-02-27 14:30:15"
+}
+```
+
+---
+
+## Parsování JSON
+
+### Použití knihovny ArduinoJson:
+
+```cpp
+#include <ArduinoJson.h>
+
+// Pro jedno čidlo
+DynamicJsonDocument doc(1024);
+deserializeJson(doc, json);
+
+float teplota = doc["teplota"];
+float vlhkost = doc["vlhkost"];
+String cas = doc["cas"];
+
+// Pro všechna čidla (all=1)
+DynamicJsonDocument doc(4096);  // Větší buffer
+deserializeJson(doc, json);
+
+JsonObject root = doc.as<JsonObject>();
+for (JsonPair kv : root) {
+  int idCidla = atoi(kv.key().c_str());
+  JsonObject cidlo = kv.value();
+  
+  if (idCidla == CIDLO_OBYVAK) {
+    float teplota = cidlo["teplota"];
+    float vlhkost = cidlo["vlhkost"];
+    // Zpracovat data...
+  }
+}
+```
+
+---
+
+## Parametry URL
+
+| Parametr | Popis | Povinné |
+|----------|-------|---------|
+| `id` | ID čidla nebo uživatele | ✅ Ano |
+| `export_key` | Export klíč z administrace | ✅ Ano |
+| `all=1` | Exportovat všechna čidla uživatele | ❌ Ne |
+| `extended=1` | Denní minima/maxima | ❌ Ne |
+| `chmi=1` | Varování CHMI (pouze ČR) | ❌ Ne |
+
+---
+
+## Dostupné hodnoty v JSON
+
+| Klíč | Popis | Typ |
+|------|-------|-----|
+| `teplota` | Aktuální teplota v °C | float |
+| `vlhkost` | Relativní vlhkost v % | float |
+| `tlak` | Tlak v hPa (může být null) | float/null |
+| `cas` | Čas posledního měření | string |
+| `nadpis` | Název čidla | string |
+| `domena` | TMEP doména čidla | string |
+| `nejnizsiTeplota` | Min. teplota za den (extended=1) | float |
+| `nejvyssiTeplota` | Max. teplota za den (extended=1) | float |
+
+---
+
+## Důležité poznámky
+
+- **Export key** získáte v administraci TMEP.cz (Nastavení → Export dat)
+- Pro `all=1` musíte použít **ID uživatele**, ne ID jednotlivého čidla
+- ID čidla najdete v URL při prohlížení čidla na TMEP.cz
+- Knihovna ArduinoJson: instalujte přes Arduino IDE → Spravovat knihovny
+- Velikost bufferu pro `DynamicJsonDocument` upravte podle počtu čidel
+- JSON odpověď používá **tečku** jako desetinný oddělovač
+
+---
+
+## Příklad: Kompletní funkce pro čtení
+
+```cpp
+float precist_teplotu_z_cidla(int idCidla) {
+  HTTPClient http;
+  
+  String url = "http://tmep.cz/vystup-json.php?";
+  url += "id=" + String(idCidla);
+  url += "&export_key=" + String(TMEP_EXPORT_KEY);
+  
+  http.begin(url);
+  int httpCode = http.GET();
+  
+  float teplota = -999.0;  // Chybová hodnota
+  
+  if (httpCode == 200) {
+    String json = http.getString();
+    
+    DynamicJsonDocument doc(1024);
+    if (deserializeJson(doc, json) == DeserializationError::Ok) {
+      teplota = doc["teplota"] | -999.0;
+    }
+  }
+  
+  http.end();
+  return teplota;
+}
+```
