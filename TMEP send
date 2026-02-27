@@ -1,0 +1,80 @@
+# TMEP.cz - Odesílání dat
+
+## Základní informace
+
+TMEP.cz je služba pro vizualizaci dat ze senzorů. Data se odesílají jednoduchým HTTP GET požadavkem.
+
+## Konfigurace
+
+```cpp
+// Doména pro zápis (získáte v administraci TMEP.cz)
+const char* TMEP_DOMENA = "vase-domena.tmep.cz";
+
+// Volitelně: interval odesílání (doporučeno 1-10 minut)
+const unsigned long INTERVAL_ODESLANI = 300000;  // 5 minut v ms
+```
+
+## Jak odeslat data
+
+### Formát URL:
+```
+http://DOMENA.tmep.cz/?temp=23.5&hum=65.2&press=1013.25
+```
+
+### Dostupné parametry:
+
+| Parametr | Popis | Příklad hodnoty |
+|----------|-------|-----------------|
+| `temp` | Teplota v °C | `23.5` |
+| `hum` | Relativní vlhkost v % | `65.2` |
+| `press` | Atmosférický tlak v hPa | `1013.25` |
+| `volt` | Napětí baterie v V (volitelné) | `3.7` |
+| `rssi` | Síla WiFi signálu v dBm (volitelné) | `-65` |
+
+### Příklad odesílání:
+
+```cpp
+void odeslat_na_tmep(float teplota, float vlhkost) {
+  HTTPClient http;
+  
+  String url = "http://" + String(TMEP_DOMENA) + "/?";
+  url += "temp=" + String(teplota, 1);      // 1 = počet desetinných míst
+  url += "&hum=" + String(vlhkost, 1);
+  
+  http.begin(url);
+  int httpCode = http.GET();
+  http.end();
+}
+```
+
+### S tlak a dalšími parametry:
+
+```cpp
+String url = "http://" + String(TMEP_DOMENA) + "/?";
+url += "temp=" + String(teplota, 1);
+url += "&hum=" + String(vlhkost, 1);
+url += "&press=" + String(tlak, 2);
+url += "&volt=" + String(napeti, 2);
+url += "&rssi=" + String(WiFi.RSSI());
+```
+
+## Důležité poznámky
+
+- V URL používejte **tečku** jako desetinný oddělovač (ne čárku)
+- Doménu pro zápis najdete v administraci TMEP.cz po vytvoření čidla
+- Odesílejte data pravidelně (ideálně každých 5-10 minut)
+- HTTP požadavek je typu GET (ne POST)
+- Odpověď serveru obsahuje potvrzení nebo chybovou hlášku
+
+## Typická odpověď serveru
+
+Úspěch:
+```
+Hodnota teploty: 23.5
+Hodnota vlhkosti: 65.2
+```
+
+Chyba:
+```
+Chybná doména nebo neplatné ID
+```
